@@ -39,6 +39,9 @@ users_col = db['users']
 @bot.message_handler(commands=['start'])
 def start_handler(message):
     user_id = message.from_user.id
+    # Always clear any lingering multi-step handlers on /start
+    bot.clear_step_handler_by_chat_id(message.chat.id)
+    
     text = message.text.split()
 
     # User entry via Deep Link
@@ -50,7 +53,7 @@ def start_handler(message):
                 price = ch_data.get('price', '0')
                 markup = InlineKeyboardMarkup()
                 
-                # Single 30-Day Plan Button (43200 Minutes = 30 Days)
+                # Fixed 30-Day Plan Button (43200 minutes)
                 markup.add(InlineKeyboardButton(f"💳 Pay ₹{price} for 30 Days Access", callback_data=f"select_{ch_id}_43200"))
                 markup.add(InlineKeyboardButton("📞 Contact Admin", url=f"https://t.me/{CONTACT_USERNAME}"))
                 
@@ -72,6 +75,7 @@ def start_handler(message):
 
 @bot.message_handler(commands=['channels'], func=lambda m: m.from_user.id == ADMIN_ID)
 def list_channels(message):
+    bot.clear_step_handler_by_chat_id(message.chat.id)
     markup = InlineKeyboardMarkup()
     cursor = channels_col.find({"admin_id": ADMIN_ID})
     count = 0
@@ -88,12 +92,15 @@ def list_channels(message):
 
 @bot.message_handler(commands=['add'], func=lambda m: m.from_user.id == ADMIN_ID)
 def add_channel_start(message):
+    # FORCE CLEAR ANY STUCK PREVIOUS STEPS
+    bot.clear_step_handler_by_chat_id(message.chat.id)
     msg = bot.send_message(ADMIN_ID, "Please ensure the bot is an Admin in your channel, then FORWARD any message from that channel here.")
     bot.register_next_step_handler(msg, get_plans)
 
 @bot.callback_query_handler(func=lambda call: call.data == "add_new")
 def cb_add_new(call):
     bot.answer_callback_query(call.id)
+    bot.clear_step_handler_by_chat_id(call.message.chat.id)
     msg = bot.send_message(ADMIN_ID, "Please FORWARD any message from your channel here.")
     bot.register_next_step_handler(msg, get_plans)
 
@@ -103,7 +110,7 @@ def get_plans(message):
         ch_name = message.forward_from_chat.title
         msg = bot.send_message(
             ADMIN_ID, 
-            f"Channel Detected: *{ch_name}*\n\nEnter the price in INR for **30-Day** subscription.\n\nExample:\n`199`", 
+            f"Channel Detected: *{ch_name}*\n\nEnter the price in INR for 30-Day subscription.\n\nExample:\n`199`", 
             parse_mode="Markdown"
         )
         bot.register_next_step_handler(msg, finalize_channel, ch_id, ch_name)
@@ -112,11 +119,14 @@ def get_plans(message):
 
 def finalize_channel(message, ch_id, ch_name):
     try:
-        # Extract digits from admin text input
-        price_input = re.sub(r'[^\d]', '', message.text.strip())
+        # Extract numbers only (removes spaces, symbols, and formatting errors)
+        raw_text = message.text.strip()
+        price_digits = re.findall(r'\d+', raw_text)
         
-        if not price_input:
-            raise ValueError("No numbers found")
+        if not price_digits:
+            raise ValueError("No digits entered")
+            
+        price_input = price_digits[0]
             
         channels_col.update_one(
             {"channel_id": ch_id}, 
@@ -131,7 +141,7 @@ def finalize_channel(message, ch_id, ch_name):
             parse_mode="Markdown"
         )
     except Exception as e:
-        bot.send_message(ADMIN_ID, "❌ Invalid format. Please enter a simple number for the price (e.g., 199). Use /add to retry.")
+        bot.send_message(ADMIN_ID, f"❌ Format error. Please enter a simple number for the price (e.g., 199). Use /add to retry.")
 
 # --- USER: PAYMENT FLOW ---
 
@@ -193,7 +203,7 @@ def approve_now(call):
         expiry_datetime = datetime.now() + timedelta(minutes=mins)
         expiry_ts = int(expiry_datetime.timestamp())
 
-        # Link expires when sub ends
+        # Link expires when subscription ends
         link = bot.create_chat_invite_link(ch_id, member_limit=1, expire_date=expiry_ts)
         
         users_col.update_one({"user_id": u_id, "channel_id": ch_id}, {"$set": {"expiry": expiry_datetime.timestamp()}}, upsert=True)
