@@ -12,16 +12,36 @@ from threading import Thread
 # --- LOGGING SETUP ---
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 
-# --- HARDCODED SUBSCRIPTION SETTINGS ---
-FIXED_PRICE = "199"         # Fixed price in INR
-FIXED_DURATION_DAYS = 30     # Fixed subscription length in Days
+# --- PRESET CONFIGURATION ---
+FIXED_PRICE = "199"         # Fixed subscription price in INR
+FIXED_DURATION_DAYS = 30     # Fixed duration in Days
 FIXED_MINUTES = 43200        # 30 Days in minutes (30 * 24 * 60)
+
+# --- ENVIRONMENT VARIABLES & VALIDATION ---
+BOT_TOKEN = os.getenv('BOT_TOKEN')
+MONGO_URI = os.getenv('MONGO_URI')
+UPI_ID = os.getenv('UPI_ID')
+CONTACT_USERNAME = os.getenv('CONTACT_USERNAME')
+ADMIN_ID_RAW = os.getenv('ADMIN_ID')
+
+if not all([BOT_TOKEN, MONGO_URI, UPI_ID, CONTACT_USERNAME, ADMIN_ID_RAW]):
+    logging.critical("CRITICAL ERROR: Environment variables missing on Render!")
+    sys.exit(1)
+
+try:
+    ADMIN_ID = int(ADMIN_ID_RAW.strip())
+except ValueError:
+    logging.critical("CRITICAL ERROR: ADMIN_ID environment variable must be an integer.")
+    sys.exit(1)
+
+if CONTACT_USERNAME.startswith('@'):
+    CONTACT_USERNAME = CONTACT_USERNAME[1:]
 
 # --- RENDER KEEP-ALIVE SERVER ---
 app = Flask('')
 @app.route('/')
 def home(): 
-    return "Bot is running and healthy!"
+    return "Bot is running healthy!"
 
 def run_web():
     port = int(os.environ.get("PORT", 5000))
@@ -30,52 +50,27 @@ def run_web():
 def keep_alive():
     Thread(target=run_web, daemon=True).start()
 
-# --- CONFIGURATION & SAFEGUARD CHECK ---
-BOT_TOKEN = os.getenv('BOT_TOKEN')
-MONGO_URI = os.getenv('MONGO_URI')
-UPI_ID = os.getenv('UPI_ID')
-CONTACT_USERNAME = os.getenv('CONTACT_USERNAME')
-ADMIN_ID_RAW = os.getenv('ADMIN_ID')
-
-if not all([BOT_TOKEN, MONGO_URI, UPI_ID, CONTACT_USERNAME, ADMIN_ID_RAW]):
-    logging.critical("CRITICAL: One or more Environment Variables are missing on Render!")
-    sys.exit(1)
-
-try:
-    ADMIN_ID = int(ADMIN_ID_RAW.strip())
-except ValueError:
-    logging.critical("CRITICAL: ADMIN_ID environment variable must be a valid number.")
-    sys.exit(1)
-
-# Clean CONTACT_USERNAME (remove @ if included)
-if CONTACT_USERNAME.startswith('@'):
-    CONTACT_USERNAME = CONTACT_USERNAME[1:]
-
-# --- BOT & DB INITIALIZATION WITH TIMEOUT SAFEGUARDS ---
+# --- INITIALIZATION ---
 bot = telebot.TeleBot(BOT_TOKEN)
 
-try:
-    # serverSelectionTimeoutMS prevents bot freezing indefinitely if DB IP isn't whitelisted
-    client = MongoClient(MONGO_URI, serverSelectionTimeoutMS=5000)
-    client.admin.command('ping')  # Test database connection immediately
-    db = client['sub_management']
-    channels_col = db['channels']
-    users_col = db['users']
-    logging.info("MongoDB Connection Successful!")
-except Exception as db_err:
-    logging.error(f"MongoDB Connection Failed: {db_err}")
+client = MongoClient(MONGO_URI, serverSelectionTimeoutMS=5000)
+db = client['sub_management']
+channels_col = db['channels']
+users_col = db['users']
 
-# --- ADMIN LOGIC ---
+# Temporary in-memory state tracking to eliminate registration bugs
+admin_adding_state = {}
+
+# --- BOT HANDLERS ---
 
 @bot.message_handler(commands=['start'])
-def start_handler(message):
+def handle_start(message):
     try:
         user_id = message.from_user.id
-        bot.clear_step_handler_by_chat_id(message.chat.id)
-        
+        admin_adding_state.pop(user_id, None)
         text = message.text.split()
 
-        # User entry via Deep Link (/start <channel_id>)
+        # Deep Link Entry (/start <channel_id>)
         if len(text) > 1:
             try:
                 ch_id = int(text[1])
@@ -94,20 +89,20 @@ def start_handler(message):
                     )
                     return
             except Exception as dl_err:
-                logging.error(f"Deep link parsing error: {dl_err}")
+                logging.error(f"Deep link processing error: {dl_err}")
 
-        # Admin Greeting vs Normal User Greeting
+        # Greeting Screen
         if user_id == ADMIN_ID:
             bot.send_message(message.chat.id, "✅ *Admin Panel Active!*\n\n/add - Add/Update Channel\n/channels - View Managed Channels", parse_mode="Markdown")
         else:
             bot.send_message(message.chat.id, "Welcome! To join a channel, please use the invite link provided by the Admin.")
     except Exception as e:
-        logging.error(f"Error in start_handler: {e}")
+        logging.error(f"Error in handle_start: {e}")
 
 @bot.message_handler(commands=['channels'], func=lambda m: m.from_user.id == ADMIN_ID)
-def list_channels(message):
+def handle_channels(message):
     try:
-        bot.clear_step_handler_by_chat_id(message.chat.id)
+        admin_adding_state.pop(message.from_user.id, None)
         markup = InlineKeyboardMarkup()
         cursor = channels_col.find({"admin_id": ADMIN_ID})
         count = 0
@@ -122,31 +117,31 @@ def list_channels(message):
         else:
             bot.send_message(ADMIN_ID, "Your Managed Channels:", reply_markup=markup)
     except Exception as e:
-        bot.send_message(ADMIN_ID, f"❌ DB Error: `{str(e)}`", parse_mode="Markdown")
+        bot.send_message(ADMIN_ID, f"❌ Database Error: `{str(e)}`", parse_mode="Markdown")
 
 @bot.message_handler(commands=['add'], func=lambda m: m.from_user.id == ADMIN_ID)
-def add_channel_start(message):
-    bot.clear_step_handler_by_chat_id(message.chat.id)
-    msg = bot.send_message(ADMIN_ID, "Please ensure the bot is an **Admin** in your channel, then **FORWARD** any message from that channel here.", parse_mode="Markdown")
-    bot.register_next_step_handler(msg, auto_finalize_channel)
+def handle_add_command(message):
+    admin_adding_state[message.from_user.id] = True
+    bot.send_message(ADMIN_ID, "Please ensure the bot is an **Admin** in your channel, then **FORWARD** any message from that channel here.", parse_mode="Markdown")
 
 @bot.callback_query_handler(func=lambda call: call.data == "add_new")
-def cb_add_new(call):
+def handle_add_callback(call):
     bot.answer_callback_query(call.id)
-    bot.clear_step_handler_by_chat_id(call.message.chat.id)
-    msg = bot.send_message(ADMIN_ID, "Please ensure the bot is an **Admin** in your channel, then **FORWARD** any message from that channel here.", parse_mode="Markdown")
-    bot.register_next_step_handler(msg, auto_finalize_channel)
+    admin_adding_state[call.from_user.id] = True
+    bot.send_message(ADMIN_ID, "Please ensure the bot is an **Admin** in your channel, then **FORWARD** any message from that channel here.", parse_mode="Markdown")
 
-def auto_finalize_channel(message):
+@bot.message_handler(func=lambda m: m.from_user.id == ADMIN_ID and admin_adding_state.get(m.from_user.id, False), content_types=['text', 'photo', 'video', 'document'])
+def handle_forwarded_message(message):
     try:
-        # Multi-layer detection for forwarded channel object
+        admin_adding_state.pop(message.from_user.id, None)
+        
+        # Check all possible forward properties
         chat_obj = message.forward_from_chat or getattr(message, 'sender_chat', None)
         
         if chat_obj and chat_obj.type in ['channel', 'supergroup']:
             ch_id = chat_obj.id
             ch_name = chat_obj.title or "VIP Channel"
             
-            # Save to Database
             channels_col.update_one(
                 {"channel_id": ch_id}, 
                 {"$set": {"name": ch_name, "price": FIXED_PRICE, "admin_id": ADMIN_ID}}, 
@@ -164,17 +159,17 @@ def auto_finalize_channel(message):
         else:
             bot.send_message(
                 ADMIN_ID, 
-                "❌ **Error:** Message was not forwarded directly from a channel, or forward privacy is hiding the source.\n\nUse /add to try again.",
+                "❌ **Error:** Could not detect the channel details. Make sure you **FORWARD** a message directly from the channel.\n\nType /add to try again.",
                 parse_mode="Markdown"
             )
     except Exception as e:
-        logging.error(f"Error finalizing channel: {e}")
+        logging.error(f"Error saving channel: {e}")
         bot.send_message(ADMIN_ID, f"❌ **System Error:** `{str(e)}`", parse_mode="Markdown")
 
-# --- USER: PAYMENT FLOW ---
+# --- PAYMENT FLOW ---
 
 @bot.callback_query_handler(func=lambda call: call.data.startswith('select_'))
-def user_pays(call):
+def handle_payment_selection(call):
     try:
         bot.answer_callback_query(call.id)
         _, ch_id, mins = call.data.split('_')
@@ -193,10 +188,10 @@ def user_pays(call):
             parse_mode="Markdown"
         )
     except Exception as e:
-        logging.error(f"Error in user_pays: {e}")
+        logging.error(f"Error in handle_payment_selection: {e}")
 
 @bot.callback_query_handler(func=lambda call: call.data.startswith('paid_'))
-def admin_notify(call):
+def handle_paid_notification(call):
     try:
         bot.answer_callback_query(call.id)
         _, ch_id, mins = call.data.split('_')
@@ -218,20 +213,20 @@ def admin_notify(call):
         u_markup = InlineKeyboardMarkup().add(InlineKeyboardButton("📞 Contact Admin", url=f"https://t.me/{CONTACT_USERNAME}"))
         bot.send_message(call.message.chat.id, "✅ Your payment request has been sent. Please wait for Admin approval.", reply_markup=u_markup)
     except Exception as e:
-        logging.error(f"Error in admin_notify: {e}")
+        logging.error(f"Error in handle_paid_notification: {e}")
 
 @bot.callback_query_handler(func=lambda call: call.data.startswith('rej_'))
-def reject_now(call):
+def handle_rejection(call):
     try:
         bot.answer_callback_query(call.id)
         u_id = int(call.data.split('_')[1])
         bot.send_message(u_id, "❌ Your payment verification request was rejected. Please contact support if you think this was an error.")
         bot.edit_message_text(f"❌ Rejected payment request for user ID: {u_id}.", call.message.chat.id, call.message.message_id)
     except Exception as e:
-        logging.error(f"Error in reject_now: {e}")
+        logging.error(f"Error in handle_rejection: {e}")
 
 @bot.callback_query_handler(func=lambda call: call.data.startswith('app_'))
-def approve_now(call):
+def handle_approval(call):
     try:
         bot.answer_callback_query(call.id)
         _, u_id, ch_id, mins = call.data.split('_')
@@ -240,7 +235,6 @@ def approve_now(call):
         expiry_datetime = datetime.now() + timedelta(minutes=mins)
         expiry_ts = int(expiry_datetime.timestamp())
 
-        # Generate 1-time single-use invite link expiring in 30 days
         link = bot.create_chat_invite_link(ch_id, member_limit=1, expire_date=expiry_ts)
         
         users_col.update_one({"user_id": u_id, "channel_id": ch_id}, {"$set": {"expiry": expiry_datetime.timestamp()}}, upsert=True)
@@ -253,10 +247,10 @@ def approve_now(call):
         bot.edit_message_text(f"✅ Approved user {u_id} for {FIXED_DURATION_DAYS} Days access.", call.message.chat.id, call.message.message_id)
         
     except Exception as e:
-        bot.send_message(ADMIN_ID, f"❌ **Error Creating Invite Link:** Ensure the bot is an **Admin** in the channel with *Invite Users via Link* permission.\n\nDetails: `{str(e)}`", parse_mode="Markdown")
+        bot.send_message(ADMIN_ID, f"❌ **Error Creating Invite Link:** Make sure the bot is an **Admin** in the channel with *Invite Users via Link* permissions.\n\nDetails: `{str(e)}`", parse_mode="Markdown")
 
 @bot.callback_query_handler(func=lambda call: call.data.startswith('manage_'))
-def manage_ch(call):
+def handle_manage(call):
     try:
         bot.answer_callback_query(call.id)
         ch_id = int(call.data.split('_')[1])
@@ -266,15 +260,15 @@ def manage_ch(call):
         ch_name = ch_data.get('name', 'VIP Channel') if ch_data else "VIP Channel"
         
         bot.edit_message_text(
-            f"Settings for: *{ch_name}*\nPrice: ₹{FIXED_PRICE} / {FIXED_DURATION_DAYS} Days\n\nYour Invite Link:\n`{link}`", 
+            f"Settings for: *{ch_name}*\nPrice: ₹{FIXED_PRICE} / {FIXED_DURATION_DAYS} Days\n\nYour Shareable Invite Link:\n`{link}`", 
             call.message.chat.id, 
             call.message.message_id, 
             parse_mode="Markdown"
         )
     except Exception as e:
-        logging.error(f"Error in manage_ch: {e}")
+        logging.error(f"Error in handle_manage: {e}")
 
-# AUTOMATED EXPIRY & KICKING SCHEDULER
+# --- EXPIRY SCHEDULER ---
 def kick_expired_users():
     try:
         now = datetime.now().timestamp()
@@ -283,7 +277,6 @@ def kick_expired_users():
 
         for user in expired_users:
             try:
-                # Kick (ban then unban so they can rejoin later upon payment)
                 bot.ban_chat_member(user['channel_id'], user['user_id'])
                 bot.unban_chat_member(user['channel_id'], user['user_id'])
                 
@@ -293,25 +286,23 @@ def kick_expired_users():
                 bot.send_message(user['user_id'], f"⚠️ Your {FIXED_DURATION_DAYS}-Day subscription has expired.\n\nTo join again or renew, please click the button below:", reply_markup=markup)
                 users_col.delete_one({"_id": user['_id']})
             except Exception as kick_err:
-                logging.error(f"Could not kick user {user.get('user_id')}: {kick_err}")
+                logging.error(f"Kick execution error: {kick_err}")
                 users_col.delete_one({"_id": user['_id']})
     except Exception as sched_err:
-        logging.error(f"Scheduler execution error: {sched_err}")
+        logging.error(f"Scheduler error: {sched_err}")
 
-# --- BOT STARTUP ---
+# --- STARTUP EXECUTION ---
 if __name__ == '__main__':
     keep_alive()
     
-    # Background Scheduler setup
     scheduler = BackgroundScheduler()
     scheduler.add_job(kick_expired_users, 'interval', minutes=1)
     scheduler.start()
     
-    # Webhook removal to avoid polling conflicts
     try:
         bot.remove_webhook()
     except Exception as e:
-        logging.warning(f"Webhook cleanup warning: {e}")
+        logging.warning(f"Webhook cleanup note: {e}")
         
-    logging.info("Bot is active and listening for messages...")
+    logging.info("Bot started running successfully.")
     bot.infinity_polling(timeout=20, long_polling_timeout=10, skip_pending=True)
